@@ -678,7 +678,9 @@ def add_ducktrace_header(source: str, path: Path, root: Path) -> str:
     # Find the first top-level preprocessor/source boundary.
     #
     # We intentionally put DuckTrace BEFORE the first #if/#ifdef/#ifndef.
-    # Includes and harmless #define/#pragma lines may remain before it.
+    # For files without an early conditional, it is placed after the normal
+    # include/pragma section but BEFORE any #define. This is important because
+    # multiline macros use trailing backslashes and must never be interrupted.
     #
     # Example:
     #
@@ -714,9 +716,24 @@ def add_ducktrace_header(source: str, path: Path, root: Path) -> str:
         depth = _preprocessor_depth(line, depth)
 
     if insert_at is None:
-        # No conditional block before the normal source. Put the include after
-        # the initial include/pragma/define area, but never after C++ code.
-        last_header_line = -1
+        # No conditional block before the normal source.
+        #
+        # IMPORTANT: Do NOT treat #define as part of the "header area".
+        # A C/C++ macro can continue onto the following lines with a trailing
+        # backslash:
+        #
+        #   #define blk(i) \
+        #     (block->l[i & 15] = \
+        #      ...)
+        #
+        # Inserting DuckTrace between the #define line and its continuation
+        # corrupts the macro. This was the cause of the sha1_digest.cpp build
+        # failure.
+        #
+        # The safest location is immediately after the initial include/pragma
+        # section and BEFORE the first macro definition or ordinary C++ code.
+
+        insert_at = None
 
         for i, line in enumerate(lines):
             stripped = line.strip()
@@ -727,14 +744,16 @@ def add_ducktrace_header(source: str, path: Path, root: Path) -> str:
             if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
                 continue
 
-            if stripped.startswith("#include") or stripped.startswith("#pragma") or stripped.startswith("#define"):
-                last_header_line = i
+            if re.match(r"^#\\s*include\\b", stripped) or re.match(r"^#\\s*pragma\\b", stripped):
+                insert_at = i + 1
                 continue
 
-            # Stop once ordinary C++ code is encountered.
+            # Stop before ALL #define directives and ordinary source code.
+            # This guarantees the include cannot land inside a multiline macro.
             break
 
-        insert_at = last_header_line + 1 if last_header_line >= 0 else 0
+        if insert_at is None:
+            insert_at = 0
 
     lines.insert(insert_at, ducktrace_header + newline)
     return "".join(lines)
