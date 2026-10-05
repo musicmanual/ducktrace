@@ -371,19 +371,62 @@ def looks_like_nonfunction_block(header: str) -> bool:
     ):
         return True
 
-    # Lambda expression:
-    #   [](...) {
-    #   [capture] { ...
-    if re.search(r"(?:^|[=\(\[,])\s*\[[^\]]*\]\s*(?:\([^;{}]*\))?\s*(?:mutable\s*)?(?:noexcept\b[^{}]*)?(?:->[^{}]+)?\s*$", h):
+    # Lambda expressions are deliberately not traced. Their body is not a
+    # normal named function definition and __FUNCTION__ would not identify
+    # the enclosing function in the way this injector expects.
+    if re.search(
+        r"(?:^|[=\(\[,])\s*\[[^\]]*\]\s*"
+        r"(?:\([^;{}]*\))?\s*"
+        r"(?:mutable\s*)?"
+        r"(?:noexcept\b[^{}]*)?"
+        r"(?:->[^{}]+)?\s*$",
+        h,
+    ):
         return True
 
-    # Initializer-list / braced initialization.
+    # Initializer/object/array/aggregate declarations are not function
+    # definitions. Examples:
+    #
+    #   static const Foo table[] = {
+    #   Foo value = {
+    #   SomeType x{ ...
+    #
+    # A function definition may contain '=' in a default argument, so only
+    # reject '=' when the declaration does not have a plausible function
+    # parameter list.
     if "=" in h and not re.search(r"\boperator\s*=", h):
-        # A normal function declaration can contain default arguments with =,
-        # so only classify as initialization when no plausible parameter list
-        # is present.
         if "(" not in h:
             return True
+
+    # Strong initializer indicators immediately before the brace.
+    #
+    # These are common forms where the opening brace starts an initializer
+    # rather than a function body.
+    if re.search(
+        r"(?:\[\s*\]|\]\s*)"
+        r"(?:\s*=\s*|\s*)$",
+        h,
+    ):
+        return True
+
+    # Array declarators such as:
+    #   Foo values[10] = {
+    #   Foo values[] = {
+    #   Foo values[] {
+    #
+    # Reject if a [] declarator appears after the likely type/name portion.
+    if re.search(r"\[[^\]]*\]\s*(?:=\s*)?$", h):
+        return True
+
+    # Aggregate/object construction using direct-list initialization:
+    #   Foo value{
+    #   Foo value =
+    #
+    # Do not confuse this with a function parameter list; this check is only
+    # for headers whose final token is an identifier before the brace and
+    # which have no function parameter list.
+    if "(" not in h and re.search(r"\b[A-Za-z_]\w*\s*$", h):
+        return True
 
     # A plain namespace-like qualified name without () isn't a function.
     if "(" not in h and ")" not in h:
@@ -419,6 +462,28 @@ def extract_function_name(header: str) -> str | None:
     return None
 
 
+
+def is_non_runtime_function(header: str) -> bool:
+    """
+    Return True for function definitions where a normal runtime DuckTrace()
+    call must not be injected.
+
+    In particular, constexpr/consteval functions may be required to produce
+    compile-time constant expressions, so calling the runtime DuckTrace()
+    function from them would make the function invalid.
+
+    We inspect the function declaration/header only, not the function body.
+    """
+    h = normalize_fragment(header)
+
+    # constexpr functions cannot contain an unconditional runtime call.
+    # consteval functions are even more strictly compile-time functions.
+    if re.search(r"\b(?:constexpr|consteval)\b", h):
+        return True
+
+    return False
+
+
 def find_function_candidates(source: str) -> list[FunctionInfo]:
     masked = mask_comments_and_strings(source)
     pairs = matching_pairs(masked)
@@ -436,6 +501,12 @@ def find_function_candidates(source: str) -> list[FunctionInfo]:
         header = masked[start:open_brace]
 
         if looks_like_nonfunction_block(header):
+            continue
+
+        # Do not inject a runtime DuckTrace() call into constexpr/consteval
+        # functions. Such functions may need to remain valid constant
+        # expressions, and DuckTrace() is a normal runtime function.
+        if is_non_runtime_function(header):
             continue
 
         name = extract_function_name(header)
@@ -456,6 +527,13 @@ def find_function_candidates(source: str) -> list[FunctionInfo]:
             continue
 
         after_params = normalize_fragment(header[close_paren + 1:])
+
+        # A real function definition should not have initializer/declarator
+        # syntax after its parameter list. In particular, reject array
+        # declarators and assignment-style initializers that can make a macro
+        # or aggregate initializer look function-like.
+        if re.search(r"\[[^\]]*\]\s*(?:=\s*)?$", after_params):
+            continue
 
         # Things allowed after the parameter list of a C++ function definition.
         # Keep this deliberately conservative: arbitrary source text here is
@@ -646,117 +724,28 @@ def has_ducktrace_header(source: str) -> bool:
 
 def add_ducktrace_header(source: str, path: Path, root: Path) -> str:
     """
-    Ensure exactly one unconditional DuckTrace include exists.
+    Ensure exactly one DuckTrace include exists at the very top of the file.
 
     DuckStation source layout:
-        src/common/*.cpp  -> #include "ducktrace.h"
+        src/common/*.cpp -> #include "ducktrace.h"
         src/<other>/*.cpp -> #include "common/ducktrace.h"
 
-    IMPORTANT:
-    The include is always placed at top-level, before any #if/#ifdef block.
-    This prevents a file such as assert.cpp from hiding the declaration behind
-    #ifdef _WIN32 when building DuckStation on Linux.
-
-    Existing DuckTrace includes are removed first so a previously-injected
-    conditional include cannot prevent the correct top-level include from
-    being added.
+    The DuckTrace include is always inserted as the FIRST line of the file.
+    Existing DuckTrace includes are removed first.
     """
+
     ducktrace_header = get_ducktrace_header(path, root)
 
-    # Remove an old/incorrect include first. This also handles files that were
-    # already processed by an older version of this injector.
+    # Remove any existing DuckTrace include first.
+    # This prevents duplicate includes and fixes older injections
+    # that may have placed the header inside a conditional block.
     source = _remove_ducktrace_includes(source)
-
-    lines = source.splitlines(keepends=True)
-
-    if not lines:
-        return ducktrace_header + "\n"
 
     # Preserve the file's newline convention.
     newline = "\r\n" if "\r\n" in source else "\n"
 
-    # Find the first top-level preprocessor/source boundary.
-    #
-    # We intentionally put DuckTrace BEFORE the first #if/#ifdef/#ifndef.
-    # For files without an early conditional, it is placed after the normal
-    # include/pragma section but BEFORE any #define. This is important because
-    # multiline macros use trailing backslashes and must never be interrupted.
-    #
-    # Example:
-    #
-    #   #include "assert.h"
-    #   #include "crash_handler.h"
-    #
-    #   #ifdef _WIN32
-    #   ...
-    #   #endif
-    #
-    # becomes:
-    #
-    #   #include "assert.h"
-    #   #include "crash_handler.h"
-    #   #include "ducktrace.h"
-    #
-    #   #ifdef _WIN32
-    #   ...
-    #   #endif
-    #
-    insert_at = None
-
-    # First, find the first top-level #if/#ifdef/#ifndef. Putting the include
-    # immediately before that is the safest choice.
-    depth = 0
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-
-        if depth == 0 and re.match(r"^#\s*(?:if|ifdef|ifndef)\b", stripped):
-            insert_at = i
-            break
-
-        depth = _preprocessor_depth(line, depth)
-
-    if insert_at is None:
-        # No conditional block before the normal source.
-        #
-        # IMPORTANT: Do NOT treat #define as part of the "header area".
-        # A C/C++ macro can continue onto the following lines with a trailing
-        # backslash:
-        #
-        #   #define blk(i) \
-        #     (block->l[i & 15] = \
-        #      ...)
-        #
-        # Inserting DuckTrace between the #define line and its continuation
-        # corrupts the macro. This was the cause of the sha1_digest.cpp build
-        # failure.
-        #
-        # The safest location is immediately after the initial include/pragma
-        # section and BEFORE the first macro definition or ordinary C++ code.
-
-        insert_at = None
-
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-
-            if not stripped:
-                continue
-
-            if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
-                continue
-
-            if re.match(r"^#\\s*include\\b", stripped) or re.match(r"^#\\s*pragma\\b", stripped):
-                insert_at = i + 1
-                continue
-
-            # Stop before ALL #define directives and ordinary source code.
-            # This guarantees the include cannot land inside a multiline macro.
-            break
-
-        if insert_at is None:
-            insert_at = 0
-
-    lines.insert(insert_at, ducktrace_header + newline)
-    return "".join(lines)
+    # Put DuckTrace at the absolute top of the file.
+    return ducktrace_header + newline + source
 
 
 def validate_injection_position(source: str, func: FunctionInfo) -> bool:
