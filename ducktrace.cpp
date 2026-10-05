@@ -23,8 +23,8 @@ void DuckTrace(const char* function_name)
 
 
 void DuckTraceInstruction(
-    u32 address,
-    u32 instruction_bits,
+    unsigned int address,
+    unsigned int instruction_bits,
     const char* disassembly,
     const char* comment)
 {
