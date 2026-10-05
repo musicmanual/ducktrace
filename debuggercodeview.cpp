@@ -362,6 +362,7 @@ void DebuggerCodeView::drawInstruction(QPainter& painter, VirtualMemoryAddress a
     x += BYTES_COLUMN_WIDTH;
 
     CPU::DisassembleInstruction(&str, address, instruction_bits);
+	
 	if (is_pc)
 	{
 		SmallString comment;
@@ -374,7 +375,12 @@ void DebuggerCodeView::drawInstruction(QPainter& painter, VirtualMemoryAddress a
 			str,
 			comment
 		);
+
+		DuckTraceInstruction(address, instruction_bits, str, comment);
 	}
+	
+	
+	
     const QString disasm_text = QtUtils::StringViewToQString(str);
     painter.setPen(instruction_color);
 
