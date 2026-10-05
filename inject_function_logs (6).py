@@ -573,72 +573,171 @@ def get_ducktrace_header(path: Path, root: Path) -> str:
     return DUCKTRACE_HEADER_OTHER
 
 
+def _preprocessor_depth(line: str, depth: int) -> int:
+    """
+    Update a simple C/C++ preprocessor nesting depth.
+
+    This is intentionally conservative. We only need to distinguish a
+    top-level include from one inside #if/#ifdef/#ifndef/#else/#elif blocks.
+    """
+    stripped = line.strip()
+
+    if not stripped.startswith("#"):
+        return depth
+
+    directive = stripped[1:].lstrip()
+
+    # Ignore line continuations here; DuckTrace's own include is a single line,
+    # and normal DuckStation platform guards are simple #if/#ifdef blocks.
+    m = re.match(r"(if|ifdef|ifndef)\b", directive)
+    if m:
+        return depth + 1
+
+    if re.match(r"endif\b", directive):
+        return max(0, depth - 1)
+
+    return depth
+
+
+def _remove_ducktrace_includes(source: str) -> str:
+    """
+    Remove existing DuckTrace includes.
+
+    This deliberately removes even an include inside #ifdef _WIN32 (or another
+    conditional block), because DuckTrace is platform-independent and should
+    have exactly one unconditional declaration include.
+    """
+    lines = source.splitlines(keepends=True)
+    filtered = []
+
+    for line in lines:
+        if re.match(
+            r'^\s*#\s*include\s*[<"](?:common/)?ducktrace\.h[">]',
+            line,
+        ):
+            continue
+        filtered.append(line)
+
+    return "".join(filtered)
+
+
 def has_ducktrace_header(source: str) -> bool:
-    """Return True if either form of the DuckTrace header is already included."""
-    return re.search(
-        r'^\s*#\s*include\s*[<"](?:common/)?ducktrace\.h[">]',
-        source,
-        flags=re.MULTILINE,
-    ) is not None
+    """
+    Return True only if DuckTrace is included at top level.
+
+    An include inside #ifdef _WIN32, #if, #else, etc. does NOT count.
+    """
+    depth = 0
+
+    for line in source.splitlines():
+        stripped = line.strip()
+
+        if re.match(
+            r'^\s*#\s*include\s*[<"](?:common/)?ducktrace\.h[">]',
+            line,
+        ):
+            if depth == 0:
+                return True
+
+        depth = _preprocessor_depth(line, depth)
+
+    return False
 
 
 def add_ducktrace_header(source: str, path: Path, root: Path) -> str:
     """
-    Add the DuckTrace header to a C/C++ source file if it is not already present.
+    Ensure exactly one unconditional DuckTrace include exists.
 
-    Files directly inside src/common/ use:
-        #include "ducktrace.h"
+    DuckStation source layout:
+        src/common/*.cpp  -> #include "ducktrace.h"
+        src/<other>/*.cpp -> #include "common/ducktrace.h"
 
-    Files elsewhere under src/ use:
-        #include "common/ducktrace.h"
+    IMPORTANT:
+    The include is always placed at top-level, before any #if/#ifdef block.
+    This prevents a file such as assert.cpp from hiding the declaration behind
+    #ifdef _WIN32 when building DuckStation on Linux.
 
-    The include is placed after the last contiguous #include in the initial
-    preprocessor/include area. This avoids putting it inside a function or
-    arbitrary source block.
+    Existing DuckTrace includes are removed first so a previously-injected
+    conditional include cannot prevent the correct top-level include from
+    being added.
     """
-    if has_ducktrace_header(source):
-        return source
-
     ducktrace_header = get_ducktrace_header(path, root)
+
+    # Remove an old/incorrect include first. This also handles files that were
+    # already processed by an older version of this injector.
+    source = _remove_ducktrace_includes(source)
 
     lines = source.splitlines(keepends=True)
 
-    # Find the last include in the initial include/preprocessor area.
-    last_include = -1
-    in_initial_area = True
+    if not lines:
+        return ducktrace_header + "\n"
 
+    # Preserve the file's newline convention.
+    newline = "\r\n" if "\r\n" in source else "\n"
+
+    # Find the first top-level preprocessor/source boundary.
+    #
+    # We intentionally put DuckTrace BEFORE the first #if/#ifdef/#ifndef.
+    # Includes and harmless #define/#pragma lines may remain before it.
+    #
+    # Example:
+    #
+    #   #include "assert.h"
+    #   #include "crash_handler.h"
+    #
+    #   #ifdef _WIN32
+    #   ...
+    #   #endif
+    #
+    # becomes:
+    #
+    #   #include "assert.h"
+    #   #include "crash_handler.h"
+    #   #include "ducktrace.h"
+    #
+    #   #ifdef _WIN32
+    #   ...
+    #   #endif
+    #
+    insert_at = None
+
+    # First, find the first top-level #if/#ifdef/#ifndef. Putting the include
+    # immediately before that is the safest choice.
+    depth = 0
     for i, line in enumerate(lines):
         stripped = line.strip()
 
-        if not stripped:
-            continue
+        if depth == 0 and re.match(r"^#\s*(?:if|ifdef|ifndef)\b", stripped):
+            insert_at = i
+            break
 
-        if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
-            continue
+        depth = _preprocessor_depth(line, depth)
 
-        if stripped.startswith("#include"):
-            last_include = i
-            continue
+    if insert_at is None:
+        # No conditional block before the normal source. Put the include after
+        # the initial include/pragma/define area, but never after C++ code.
+        last_header_line = -1
 
-        # Permit common preprocessor guards/defines before includes.
-        if stripped.startswith("#"):
-            continue
+        for i, line in enumerate(lines):
+            stripped = line.strip()
 
-        # Once ordinary C++ code appears, stop searching.
-        in_initial_area = False
-        break
+            if not stripped:
+                continue
 
-    if last_include >= 0:
-        # Preserve the newline convention from the include line.
-        newline = "\n"
-        if lines[last_include].endswith("\r\n"):
-            newline = "\r\n"
-        lines.insert(last_include + 1, ducktrace_header + newline)
-        return "".join(lines)
+            if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+                continue
 
-    # No include found: put the header at the very top.
-    newline = "\r\n" if "\r\n" in source else "\n"
-    return ducktrace_header + newline + source
+            if stripped.startswith("#include") or stripped.startswith("#pragma") or stripped.startswith("#define"):
+                last_header_line = i
+                continue
+
+            # Stop once ordinary C++ code is encountered.
+            break
+
+        insert_at = last_header_line + 1 if last_header_line >= 0 else 0
+
+    lines.insert(insert_at, ducktrace_header + newline)
+    return "".join(lines)
 
 
 def validate_injection_position(source: str, func: FunctionInfo) -> bool:
