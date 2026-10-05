@@ -16,7 +16,7 @@
 #include <tlhelp32.h>
 
 #include <mutex>
-#include "common/ducktrace.h"
+#include "ducktrace.h"
 
 #ifdef __clang__
 #pragma clang diagnostic ignored "-Winvalid-noreturn"
