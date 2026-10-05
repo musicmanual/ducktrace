@@ -10,7 +10,7 @@ Usage:
 Dry run:
     - scans C/C++ source files
     - finds likely function definitions
-    - ignores if/else/for/while/switch/try/catch and other non-function blocks
+    - ignores if/else/for/while/switch/try/catch, macros, linkage blocks, and other non-function blocks
     - shows the functions
     - A = all, S = selected, Q = quit
     - asks for APPLY before changing files
@@ -355,10 +355,134 @@ def looks_like_control_block(header: str) -> bool:
     return False
 
 
+
+def line_start(source: str, pos: int) -> int:
+    """Return the start offset of the physical line containing pos."""
+    return source.rfind("\n", 0, pos) + 1
+
+
+def line_end(source: str, pos: int) -> int:
+    """Return the end offset of the physical line containing pos."""
+    end = source.find("\n", pos)
+    return len(source) if end < 0 else end
+
+
+def has_preprocessor_directive_near(source: str, pos: int) -> bool:
+    """
+    Return True if the declaration leading to pos is part of a preprocessor
+    directive or a backslash-continued preprocessor directive.
+
+    Macro bodies are especially dangerous because:
+        #define F(X) {
+    can look like a function to a simple '(...)' + '{' detector.
+    We deliberately skip macro-defined blocks rather than risk corrupting
+    source code.
+    """
+    current = line_start(source, pos)
+
+    # Walk backwards through continued lines.
+    for _ in range(64):
+        start = current
+        raw = source[start:line_end(source, start)]
+        stripped = raw.lstrip()
+
+        if stripped.startswith("#"):
+            return True
+
+        # A previous line ending in '\' is part of the same preprocessor
+        # directive.
+        if raw.rstrip().endswith("\\") and start > 0:
+            current = line_start(source, start - 1)
+            continue
+
+        break
+
+    return False
+
+
+def header_has_preprocessor_directive(header: str) -> bool:
+    """
+    Check the masked declaration for preprocessor directives.
+
+    A real C++ function definition is not itself a #define/#if directive.
+    """
+    return any(
+        re.match(r"^\s*#", line)
+        for line in header.splitlines()
+    )
+
+
+def is_linkage_block(header: str) -> bool:
+    """
+    Detect extern "C" / extern "C++" linkage blocks.
+
+    These are scope blocks, not function bodies:
+        extern "C" {
+            ...
+        }
+    """
+    h = normalize_fragment(header)
+    return bool(
+        re.match(r'^extern\s+"(?:C|C\+\+)"\s*$', h)
+        or re.match(r'^extern\s+"(?:C|C\+\+)"\s*$', h)
+    )
+
+
+def is_deleted_or_defaulted_function(header: str) -> bool:
+    """
+    A deleted/defaulted function is a declaration, not a function body.
+    Normally these have no '{', but this check makes the detector explicit
+    and protects against unusual macro/declaration forms.
+    """
+    h = normalize_fragment(header)
+    return bool(re.search(r"=\s*(?:delete|default)\s*$", h))
+
+
+def is_macro_like_function_header(header: str) -> bool:
+    """
+    Detect common macro-looking declarations.
+
+    A macro invocation such as:
+        SOME_MACRO(F)
+    or a preprocessor definition:
+        #define SOME_MACRO(F)
+    must not be mistaken for a C++ function definition.
+    """
+    h = normalize_fragment(header)
+
+    if "#" in h:
+        return True
+
+    # Function-like preprocessor macro definitions.
+    if re.match(r"^define\s+[A-Za-z_]\w*\s*\(", h):
+        return True
+
+    return False
+
 def looks_like_nonfunction_block(header: str) -> bool:
     h = normalize_fragment(header)
 
     if not h:
+        return True
+
+    # Preprocessor directives and macro-generated blocks are not normal
+    # function bodies. This specifically prevents cases such as:
+    #
+    #   #define SHADERC_SYMBOL(F) {
+    #
+    # from being mistaken for a function definition.
+    if header_has_preprocessor_directive(header):
+        return True
+
+    if is_macro_like_function_header(header):
+        return True
+
+    # extern "C" { ... } / extern "C++" { ... } are linkage/scope blocks.
+    if is_linkage_block(header):
+        return True
+
+    # Explicitly avoid declarations which don't have an executable body.
+    if is_deleted_or_defaulted_function(header):
         return True
 
     if looks_like_control_block(h):
@@ -500,7 +624,16 @@ def find_function_candidates(source: str) -> list[FunctionInfo]:
         start = statement_start(masked, open_brace)
         header = masked[start:open_brace]
 
+        # Never inject into a preprocessor/macro body. The masked source
+        # preserves '#' characters, so this remains detectable.
+        if has_preprocessor_directive_near(source, open_brace):
+            continue
+
         if looks_like_nonfunction_block(header):
+            continue
+
+        # Linkage blocks such as extern "C" { ... } are scopes, not functions.
+        if is_linkage_block(header):
             continue
 
         # Do not inject a runtime DuckTrace() call into constexpr/consteval
@@ -772,6 +905,14 @@ def validate_injection_position(source: str, func: FunctionInfo) -> bool:
         r'\b(?:namespace|class|struct|union|enum)\s+[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*\s*$',
         masked_prefix.strip(),
     ):
+        return False
+
+    # Final defense against macro/preprocessor bodies.
+    if has_preprocessor_directive_near(source, func.open_brace):
+        return False
+
+    # Final defense against extern "C" / extern "C++" scope blocks.
+    if is_linkage_block(masked_prefix):
         return False
 
     return True
