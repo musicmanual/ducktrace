@@ -364,21 +364,20 @@ void DebuggerCodeView::drawInstruction(QPainter& painter, VirtualMemoryAddress a
     CPU::DisassembleInstruction(&str, address, instruction_bits);
 	
 	if (is_pc)
-	{
-		SmallString comment;
-		CPU::DisassembleInstructionComment(&comment, address, instruction_bits);
+		{
+		  SmallString comment;
+		  CPU::DisassembleInstructionComment(&comment, address, instruction_bits);
 
-		INFO_LOG(
+		  INFO_LOG(
 			"MY_LABEL: address=0x{:08X}, opcode=0x{:08X}, disassembly={}, extra={}",
 			address,
 			instruction_bits,
 			str,
 			comment
-		);
+		  );
 
-		DuckTraceInstruction(address, instruction_bits, str, comment);
-	}
-	
+		  DuckTraceInstruction(address, instruction_bits, str, comment);
+		}
 	
 	
     const QString disasm_text = QtUtils::StringViewToQString(str);
