@@ -995,6 +995,10 @@ def iter_source_files(root: Path, include_headers: bool):
         if any(part in SKIP_DIR_NAMES for part in path.parts):
             continue
 
+        # Never scan or modify DuckTrace's own implementation/header.
+        if path.name.lower() in {"ducktrace.cpp", "ducktrace.h"}:
+            continue
+
         if path.suffix.lower() in extensions:
             yield path
 
