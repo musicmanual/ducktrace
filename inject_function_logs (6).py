@@ -32,8 +32,11 @@ from pathlib import Path
 
 INJECT_LINE = 'DuckTrace(__FUNCTION__);'
 
-DUCKTRACE_HEADER = '#include "common/ducktrace.h"'
-DUCKTRACE_HEADER_NAME = "common/ducktrace.h"
+DUCKTRACE_HEADER_COMMON = '#include "ducktrace.h"'
+DUCKTRACE_HEADER_OTHER = '#include "common/ducktrace.h"'
+
+DUCKTRACE_HEADER_NAME_COMMON = "ducktrace.h"
+DUCKTRACE_HEADER_NAME_OTHER = "common/ducktrace.h"
 
 SOURCE_EXTENSIONS = {
     ".cpp", ".cc", ".cxx", ".c++",
@@ -550,18 +553,44 @@ def indentation_for_body(source: str, brace: int) -> str:
 
 
 
+def get_ducktrace_header(path: Path, root: Path) -> str:
+    """
+    Return the appropriate DuckTrace include for this source file.
+
+    DuckStation source layout:
+        src/common/*.cpp  -> #include "ducktrace.h"
+        src/<other>/*.cpp -> #include "common/ducktrace.h"
+    """
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        # Fallback for safety if path is not below root.
+        return DUCKTRACE_HEADER_OTHER
+
+    if relative.parent == Path("common"):
+        return DUCKTRACE_HEADER_COMMON
+
+    return DUCKTRACE_HEADER_OTHER
+
+
 def has_ducktrace_header(source: str) -> bool:
-    """Return True if the DuckTrace header is already included."""
+    """Return True if either form of the DuckTrace header is already included."""
     return re.search(
-        r'^\s*#\s*include\s*[<"]common/ducktrace\.h[">]',
+        r'^\s*#\s*include\s*[<"](?:common/)?ducktrace\.h[">]',
         source,
         flags=re.MULTILINE,
     ) is not None
 
 
-def add_ducktrace_header(source: str) -> str:
+def add_ducktrace_header(source: str, path: Path, root: Path) -> str:
     """
     Add the DuckTrace header to a C/C++ source file if it is not already present.
+
+    Files directly inside src/common/ use:
+        #include "ducktrace.h"
+
+    Files elsewhere under src/ use:
+        #include "common/ducktrace.h"
 
     The include is placed after the last contiguous #include in the initial
     preprocessor/include area. This avoids putting it inside a function or
@@ -569,6 +598,8 @@ def add_ducktrace_header(source: str) -> str:
     """
     if has_ducktrace_header(source):
         return source
+
+    ducktrace_header = get_ducktrace_header(path, root)
 
     lines = source.splitlines(keepends=True)
 
@@ -602,12 +633,12 @@ def add_ducktrace_header(source: str) -> str:
         newline = "\n"
         if lines[last_include].endswith("\r\n"):
             newline = "\r\n"
-        lines.insert(last_include + 1, DUCKTRACE_HEADER + newline)
+        lines.insert(last_include + 1, ducktrace_header + newline)
         return "".join(lines)
 
     # No include found: put the header at the very top.
     newline = "\r\n" if "\r\n" in source else "\n"
-    return DUCKTRACE_HEADER + newline + source
+    return ducktrace_header + newline + source
 
 
 def validate_injection_position(source: str, func: FunctionInfo) -> bool:
@@ -639,7 +670,7 @@ def validate_injection_position(source: str, func: FunctionInfo) -> bool:
     return True
 
 
-def inject_into_file(path: Path, funcs: list[FunctionInfo]) -> tuple[bool, int]:
+def inject_into_file(path: Path, funcs: list[FunctionInfo], root: Path) -> tuple[bool, int]:
     source = path.read_text(encoding="utf-8", errors="surrogateescape")
     original_source = source
     changes = []
@@ -689,7 +720,7 @@ def inject_into_file(path: Path, funcs: list[FunctionInfo]) -> tuple[bool, int]:
 
     # Add the declaration after function-body insertions so the include does
     # not shift the offsets calculated above.
-    source = add_ducktrace_header(source)
+    source = add_ducktrace_header(source, path, root)
 
     # Final sanity check: never write if the file somehow lost content.
     if not source.strip():
@@ -899,7 +930,7 @@ def main():
 
     for path, funcs in sorted(by_file.items()):
         try:
-            changed, count = inject_into_file(path, funcs)
+            changed, count = inject_into_file(path, funcs, root)
 
             if changed:
                 modified_files += 1
